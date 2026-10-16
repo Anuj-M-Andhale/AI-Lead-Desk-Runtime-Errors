@@ -4,3 +4,7 @@ pypdf
 python-docx
 langchain-text-splitters
 langchain-ollama
+groq
+edge-tts
+streamlit
+ipywidgets
