@@ -8,3 +8,5 @@ groq
 edge-tts
 streamlit
 ipywidgets
+faster-whisper
+google-genai

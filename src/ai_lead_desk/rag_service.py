@@ -338,8 +338,8 @@ class DocumentRAGService:
             "retrieved_count": len(chunks)
         }
 
-    def _fallback(self, query):
-        language = detect_language(query)
+    def _fallback(self, query, response_language=None):
+        language = response_language or detect_language(query)
         messages = {
             "english": (
                 "I couldn't verify this information from the institute's "
@@ -356,12 +356,13 @@ class DocumentRAGService:
         }
         return messages[language]
 
-    def _clarification(self, query):
+    def _clarification(self, query, response_language=None):
+        language = response_language or detect_language(query)
         return {
             "english": "Which course are you asking about?",
             "hindi": "आप किस कोर्स के बारे में पूछ रहे हैं?",
             "marathi": "तुम्ही कोणत्या कोर्सबद्दल विचारत आहात?"
-        }[detect_language(query)]
+        }[language]
 
     def _requested_fields(self, query):
         query_lower = query.lower()
@@ -400,8 +401,10 @@ class DocumentRAGService:
         ]
         return bool(meaningful)
 
-    def _course_fact_answer(self, query, fields, section):
-        language = detect_language(query)
+    def _course_fact_answer(
+        self, query, fields, section, response_language=None
+    ):
+        language = response_language or detect_language(query)
         candidates = self.search_documents(
             query,
             top_k=max(1, len(self.document_chunks))
@@ -414,7 +417,7 @@ class DocumentRAGService:
 
         if not matching:
             return {
-                "answer": self._fallback(query),
+                "answer": self._fallback(query, language),
                 "grounded": False,
                 "sources": [],
                 "answer_mode": "fallback_no_course_evidence"
@@ -497,14 +500,18 @@ class DocumentRAGService:
             )
         }
 
-    def answer(self, query):
-        """Answer only from retrieved institute documents, or return a fallback."""
+    def answer(self, query, response_language=None):
+        """Answer using retrieved evidence and an optional response language."""
+        if response_language not in (None, 'en', 'hi', 'mr'):
+            raise ValueError(
+                "response_language must be None, 'en', 'hi', or 'mr'."
+            )
         if not isinstance(query, str) or not query.strip():
             raise ValueError("The student question cannot be empty.")
 
         query = query.strip()
         query_lower = query.lower()
-        language = detect_language(query)
+        language = response_language or detect_language(query)
 
         # Policy-specific response: require matching policy evidence.
         if self.detect_policy_query(query):
@@ -573,7 +580,7 @@ class DocumentRAGService:
             section = self._find_course_section(query)
 
             if section:
-                return self._course_fact_answer(query, fields, section)
+                return self._course_fact_answer(query, fields, section, language)
 
             if not self._has_specific_reference(query):
                 return {
@@ -584,7 +591,7 @@ class DocumentRAGService:
                 }
 
             return {
-                "answer": self._fallback(query),
+                "answer": self._fallback(query, language),
                 "grounded": False,
                 "sources": [],
                 "answer_mode": "fallback_no_course_evidence"
@@ -593,7 +600,7 @@ class DocumentRAGService:
         retrieval = self.get_retrieved_context(query, top_k=3)
         if not retrieval["retrieved_count"]:
             return {
-                "answer": self._fallback(query),
+                "answer": self._fallback(query, language),
                 "grounded": False,
                 "sources": [],
                 "answer_mode": "fallback_no_evidence"
