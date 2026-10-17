@@ -1,0 +1,67 @@
+{
+  "institute": {
+    "name": "Demo Learning Institute",
+    "is_sample_data": true,
+    "courses": [
+      {
+        "course_id": "PY001",
+        "name": "Python Programming",
+        "description": "Beginner-friendly Python programming course.",
+        "fee_inr": 8000,
+        "duration": "3 months",
+        "schedule": "Weekends",
+        "eligibility": "No prior programming experience required",
+        "syllabus": [
+          "Python fundamentals",
+          "Variables and data types",
+          "Conditions and loops",
+          "Functions",
+          "Lists and dictionaries",
+          "File handling"
+        ]
+      },
+      {
+        "course_id": "DS001",
+        "name": "Data Science Foundations",
+        "description": "Introduction to data analysis and machine learning.",
+        "fee_inr": 15000,
+        "duration": "6 months",
+        "schedule": "Monday, Wednesday and Friday",
+        "eligibility": "Basic computer skills recommended",
+        "syllabus": [
+          "Python for data analysis",
+          "NumPy",
+          "Pandas",
+          "Data visualization",
+          "Introduction to machine learning"
+        ]
+      },
+      {
+        "course_id": "WD001",
+        "name": "Web Development",
+        "description": "Beginner-friendly website development course.",
+        "fee_inr": 12000,
+        "duration": "4 months",
+        "schedule": "Evenings",
+        "eligibility": "No prior web development experience required",
+        "syllabus": [
+          "HTML",
+          "CSS",
+          "JavaScript",
+          "Responsive web design",
+          "Frontend projects"
+        ]
+      }
+    ]
+  },
+  "counselor_rules": {
+    "answer_source": "Answer course-related questions using only verified information from the institute's knowledge base.",
+    "fees_and_discounts": "Never invent fees, discounts, offers or additional charges.",
+    "placements": "Never promise a job or guaranteed placement unless explicit institute-approved information supports the claim.",
+    "missing_information": "If information is unavailable or unclear, say you cannot verify it and offer to connect the student with a counselor.",
+    "student_profiling": "Understand the student's education, skills, goals, budget and schedule through natural conversation.",
+    "recommendations": "Recommend courses based on the student's needs and explain the reason honestly. Never guarantee outcomes.",
+    "language": "Reply in the student's language and conversational style. Support English, Hindi, Marathi and mixed-language messages.",
+    "human_handover": "Refer unresolved questions to a human counselor when needed."
+  }
+}
