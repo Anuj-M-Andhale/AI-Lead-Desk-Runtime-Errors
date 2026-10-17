@@ -1,4 +1,5 @@
 import os
+import requests
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,48 @@ load_dotenv(PROJECT_DIR / ".env")
 
 from ai_lead_desk.rag_service import DocumentRAGService
 from ai_lead_desk.voice_service import process_voice_message
+
+
+# =========================================================
+# COUNSELOR BACKEND API
+# =========================================================
+
+COUNSELOR_API_URL = (
+    os.getenv(
+        "AI_LEAD_DESK_API_URL",
+        "http://127.0.0.1:8001",
+    ).strip()
+    or "http://127.0.0.1:8001"
+).rstrip("/")
+
+
+def get_counselor_api_headers():
+    """Return authenticated API headers without exposing the key."""
+    api_key = os.getenv("COUNSELOR_API_KEY", "").strip()
+
+    if not api_key:
+        raise RuntimeError(
+            "COUNSELOR_API_KEY is missing. Configure it in the project .env "
+            "with the same key used by the backend API."
+        )
+
+    return {"X-API-Key": api_key}
+
+
+def get_counselor_api_error(response):
+    """Extract a concise message from an API error response."""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    detail = payload.get("detail") or payload.get("message")
+
+    if not detail:
+        detail = f"HTTP {response.status_code}"
+
+    return str(detail)[:350]
+
 
 
 # =========================================================
@@ -144,7 +187,7 @@ def get_document_files():
     """Return supported files in the institute documents directory."""
     return sorted(
         path
-        for path in DOCUMENTS_DIR.iterdir()
+        for path in DOCUMENTS_DIR.rglob('*')
         if path.is_file()
         and path.suffix.lower() in SUPPORTED_DOCUMENT_EXTENSIONS
     )
@@ -170,6 +213,7 @@ st.sidebar.metric(
 )
 
 st.sidebar.metric(
+    "Counselor Inbox",
     "Counselor Follow-ups",
     len(st.session_state.followups),
 )
@@ -307,11 +351,12 @@ def add_followup(
 # 9. MAIN DASHBOARD TABS
 # =========================================================
 
-text_tab, voice_tab, knowledge_tab, followup_tab = st.tabs(
+text_tab, voice_tab, knowledge_tab, inbox_tab, followup_tab = st.tabs(
     [
         "💬 Text Inquiries",
         "🎙️ Voice Inquiries",
         "📚 Knowledge Base",
+        "Counselor Inbox",
         "🧑‍💼 Counselor Follow-ups",
     ]
 )
@@ -645,42 +690,646 @@ with knowledge_tab:
     st.subheader("Institute Knowledge Base")
 
     st.write(
-        "The RAG service reads supported document files from:"
+        "Upload institute reference documents here. The backend accepts "
+        "PDF and DOCX files up to 15 MB and attempts to index each upload."
     )
 
-    st.code(str(DOCUMENTS_DIR))
+    st.caption(f"Backend API: {COUNSELOR_API_URL}")
 
-    # Refresh the visible file list.
-    current_document_files = get_document_files()
+    # Display the result of the most recent explicit re-index operation.
+    kb_notice = st.session_state.pop("kb_notice", None)
 
-    if current_document_files:
+    if kb_notice:
+        st.success(kb_notice)
 
-        for document_path in current_document_files:
-            st.write(f"📄 {document_path.name}")
+    uploaded_document = st.file_uploader(
+        "Upload institute document",
+        type=["pdf", "docx"],
+        help="Select a PDF or Word document, maximum 15 MB.",
+        key="kb_document_uploader",
+    )
 
-    else:
+    upload_column, reindex_column = st.columns(2)
 
-        st.info(
-            "No supported institute documents were found."
+    with upload_column:
+        upload_clicked = st.button(
+            "Upload and index",
+            key="kb_upload_button",
+            disabled=uploaded_document is None,
+            use_container_width=True,
         )
 
+    with reindex_column:
+        reindex_clicked = st.button(
+            "Re-index all documents",
+            key="kb_reindex_button",
+            use_container_width=True,
+        )
+
+    # -----------------------------------------------------
+    # UPLOAD DOCUMENT
+    # -----------------------------------------------------
+
+    if upload_clicked and uploaded_document is not None:
+
+        if uploaded_document.size > 15 * 1024 * 1024:
+            st.error("The document exceeds the backend's 15 MB file limit.")
+
+        else:
+            try:
+                response = requests.post(
+                    f"{COUNSELOR_API_URL}/api/documents/upload",
+                    headers=get_counselor_api_headers(),
+                    files={
+                        "file": (
+                            uploaded_document.name,
+                            uploaded_document.getvalue(),
+                            uploaded_document.type
+                            or "application/octet-stream",
+                        )
+                    },
+                    timeout=(10, 300),
+                )
+
+                if not response.ok:
+                    st.error(
+                        "Upload failed: "
+                        + get_counselor_api_error(response)
+                    )
+
+                else:
+                    result = response.json()
+
+                    filename = result.get(
+                        "filename",
+                        uploaded_document.name,
+                    )
+
+                    index_status = result.get(
+                        "index_status",
+                        "unknown",
+                    )
+
+                    if index_status == "indexed":
+                        st.success(
+                            f"{filename} was uploaded. "
+                            "The backend reports it as indexed."
+                        )
+                    else:
+                        st.warning(
+                            f"{filename} was stored, but indexing is pending. "
+                            "Check the backend logs and embedding service, "
+                            "then retry re-indexing."
+                        )
+
+                    # Update the RAG instance used by this Streamlit process.
+                    try:
+                        refreshed = rag_service.refresh_index_if_changed()
+
+                        if refreshed:
+                            st.info(
+                                "The dashboard's local RAG index was refreshed."
+                            )
+
+                    except Exception as refresh_exc:
+                        st.warning(
+                            "The upload response was received, but the "
+                            "dashboard's local RAG index could not refresh. "
+                            "Check the local embedding service. "
+                            f"Error type: {type(refresh_exc).__name__}."
+                        )
+
+            except RuntimeError as exc:
+                st.error(str(exc))
+
+            except requests.RequestException as exc:
+                st.error(
+                    "Could not reach the document API. Confirm that the "
+                    "backend is running on the configured URL. "
+                    f"Error type: {type(exc).__name__}."
+                )
+
+            except ValueError:
+                st.error(
+                    "The document API returned an unreadable response."
+                )
+
+    # -----------------------------------------------------
+    # RE-INDEX ALL DOCUMENTS
+    # -----------------------------------------------------
+
+    if reindex_clicked:
+
+        try:
+            response = requests.post(
+                f"{COUNSELOR_API_URL}/api/documents/reindex",
+                headers=get_counselor_api_headers(),
+                timeout=(10, 900),
+            )
+
+            if not response.ok:
+                st.error(
+                    "Re-index failed: "
+                    + get_counselor_api_error(response)
+                )
+
+            else:
+                result = response.json()
+
+                document_count = result.get("documents")
+                chunk_count = result.get("chunks")
+
+                summary = "Backend re-index completed."
+
+                if document_count is not None:
+                    summary += f" Documents: {document_count}."
+
+                if chunk_count is not None:
+                    summary += f" Chunks: {chunk_count}."
+
+                st.session_state["kb_notice"] = summary
+
+                # Recreate Streamlit's own cached RAG instance on rerun.
+                get_rag_service.clear()
+                st.rerun()
+
+        except RuntimeError as exc:
+            st.error(str(exc))
+
+        except requests.RequestException as exc:
+            st.error(
+                "Could not complete the re-index request. Check the backend "
+                "and embedding service. "
+                f"Error type: {type(exc).__name__}."
+            )
+
+        except ValueError:
+            st.error(
+                "The re-index endpoint returned an unreadable response."
+            )
+
+    # -----------------------------------------------------
+    # DOCUMENT STATUS TABLE
+    # -----------------------------------------------------
+
+    st.divider()
+    st.subheader("Stored Documents")
+
     st.metric(
-        "Currently Indexed Chunks",
+        "Dashboard Indexed Chunks",
         len(rag_service.document_chunks),
     )
 
-    st.caption(
-        "This version displays document status. Document uploading, "
-        "approval, and re-indexing controls have not been implemented yet."
-    )
+    try:
+        listing_response = requests.get(
+            f"{COUNSELOR_API_URL}/api/documents",
+            headers=get_counselor_api_headers(),
+            timeout=(5, 20),
+        )
 
-    st.info(
-        "Adding a new file to the folder does not automatically rebuild "
-        "the existing RAG index. Re-indexing must be implemented separately."
-    )
+        if not listing_response.ok:
+            st.warning(
+                "Could not load the document list: "
+                + get_counselor_api_error(listing_response)
+            )
+
+        else:
+            listing_payload = listing_response.json()
+            documents = listing_payload.get("documents", [])
+
+            st.metric("Stored Documents", len(documents))
+
+            if documents:
+                table_rows = []
+
+                for document in documents:
+                    filename = document.get("filename", "Unknown")
+
+                    # Support either size_bytes or size in the API response.
+                    size_bytes = document.get(
+                        "size_bytes",
+                        document.get("size", 0),
+                    ) or 0
+
+                    try:
+                        size_mb = round(float(size_bytes) / (1024 * 1024), 2)
+                    except (TypeError, ValueError):
+                        size_mb = 0.0
+
+                    table_rows.append({
+                        "Document": filename,
+                        "Type": document.get(
+                            "extension",
+                            Path(filename).suffix.lower(),
+                        ),
+                        "Size (MB)": size_mb,
+                        "Index Status": document.get(
+                            "index_status",
+                            document.get("status", "unknown"),
+                        ),
+                        "Stored Path": document.get("relative_path", ""),
+                    })
+
+                st.dataframe(
+                    table_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            else:
+                st.info(
+                    "No supported documents are currently listed by the API."
+                )
+
+    except RuntimeError as exc:
+        st.error(str(exc))
+
+    except requests.RequestException as exc:
+        st.warning(
+            "The document list is currently unavailable. "
+            f"Error type: {type(exc).__name__}."
+        )
+
+    except ValueError:
+        st.warning(
+            "The document API returned an unreadable list response."
+        )
+
 
 
 # =========================================================
+
+# =========================================================
+# 13. COUNSELOR INBOX
+# =========================================================
+
+with inbox_tab:
+
+    st.subheader("Telegram Counselor Inbox")
+    st.caption(
+        "Review conversations, take over from AI, and reply in the "
+        "student's existing Telegram chat."
+    )
+
+    inbox_notice = st.session_state.pop("inbox_notice", None)
+    if inbox_notice:
+        st.success(inbox_notice)
+
+    if st.button("Refresh inbox", key="counselor_refresh_inbox"):
+        st.rerun()
+
+    try:
+        inbox_response = requests.get(
+            f"{COUNSELOR_API_URL}/api/conversations",
+            params={"platform": "telegram", "limit": 200},
+            headers=get_counselor_api_headers(),
+            timeout=(5, 20),
+        )
+
+        if not inbox_response.ok:
+            st.error(
+                "Could not load conversations: "
+                + get_counselor_api_error(inbox_response)
+            )
+            conversations = []
+
+        else:
+            conversations = inbox_response.json().get(
+                "conversations", []
+            )
+
+    except RuntimeError as exc:
+        st.error(str(exc))
+        conversations = []
+
+    except requests.RequestException as exc:
+        st.error(
+            "The conversation API is unavailable. Make sure the backend "
+            "has been restarted with the latest code. "
+            f"Error type: {type(exc).__name__}."
+        )
+        conversations = []
+
+    except ValueError:
+        st.error("The conversation API returned an invalid response.")
+        conversations = []
+
+    if not conversations:
+        st.info(
+            "No Telegram conversations were found yet. Start the Telegram "
+            "bot, send it a message from a student account, then refresh."
+        )
+
+    else:
+        # Telegram user IDs are unique in the existing leads table.
+        conversation_by_id = {
+            str(item["platform_user_id"]): item
+            for item in conversations
+        }
+        conversation_ids = list(conversation_by_id)
+
+        def _inbox_label(user_id):
+            item = conversation_by_id[user_id]
+            student_name = item.get("name") or "Student"
+            mode = (item.get("handling_mode") or "ai").upper()
+            unread = item.get("unread_count", 0) or 0
+            last_message = str(item.get("last_message") or "").replace(
+                "\n", " "
+            )[:48]
+
+            return (
+                f"{student_name} | ID {user_id} | {mode} | "
+                f"{unread} unread | {last_message}"
+            )
+
+        previous_selection = st.session_state.get(
+            "counselor_selected_telegram_uid"
+        )
+        selected_index = (
+            conversation_ids.index(previous_selection)
+            if previous_selection in conversation_ids
+            else 0
+        )
+
+        selected_uid = st.selectbox(
+            "Select conversation",
+            options=conversation_ids,
+            index=selected_index,
+            format_func=_inbox_label,
+            key="counselor_selected_telegram_uid",
+        )
+
+        selected = conversation_by_id[selected_uid]
+        current_mode = selected.get("handling_mode") or "ai"
+
+        st.divider()
+
+        student_col, mode_col, unread_col = st.columns(3)
+
+        with student_col:
+            st.metric("Student", selected.get("name") or "Unknown")
+
+        with mode_col:
+            st.metric("Handling mode", current_mode.upper())
+
+        with unread_col:
+            st.metric(
+                "Unread messages",
+                selected.get("unread_count", 0) or 0,
+            )
+
+        if not selected.get("chat_id"):
+            st.warning(
+                "This conversation has no stored Telegram chat destination. "
+                "Ask the student to send a new message to the bot after "
+                "the updated bot has been restarted."
+            )
+
+        action_col, resume_col = st.columns(2)
+
+        with action_col:
+            if current_mode != "human":
+                if st.button(
+                    "Take over conversation",
+                    key=f"takeover_{selected_uid}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        action_response = requests.post(
+                            f"{COUNSELOR_API_URL}/api/conversations/"
+                            f"telegram/{selected_uid}/takeover",
+                            headers=get_counselor_api_headers(),
+                            timeout=(5, 20),
+                        )
+
+                        if action_response.ok:
+                            result = action_response.json()
+                            st.session_state["inbox_notice"] = result.get(
+                                "message", "Human takeover enabled."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Takeover failed: "
+                                + get_counselor_api_error(action_response)
+                            )
+
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                    except requests.RequestException as exc:
+                        st.error(
+                            f"Takeover request failed: {type(exc).__name__}."
+                        )
+
+        with resume_col:
+            if current_mode == "human":
+                if st.button(
+                    "Resume AI",
+                    key=f"resume_{selected_uid}",
+                    use_container_width=True,
+                ):
+                    try:
+                        action_response = requests.post(
+                            f"{COUNSELOR_API_URL}/api/conversations/"
+                            f"telegram/{selected_uid}/resume",
+                            headers=get_counselor_api_headers(),
+                            timeout=(5, 20),
+                        )
+
+                        if action_response.ok:
+                            st.session_state["inbox_notice"] = (
+                                "AI handling resumed."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Resume failed: "
+                                + get_counselor_api_error(action_response)
+                            )
+
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                    except requests.RequestException as exc:
+                        st.error(
+                            f"Resume request failed: {type(exc).__name__}."
+                        )
+
+        st.divider()
+        st.subheader("Conversation History")
+
+        try:
+            history_response = requests.get(
+                f"{COUNSELOR_API_URL}/api/conversations/"
+                f"telegram/{selected_uid}/messages",
+                params={"limit": 300},
+                headers=get_counselor_api_headers(),
+                timeout=(5, 20),
+            )
+
+            if not history_response.ok:
+                st.error(
+                    "Could not load message history: "
+                    + get_counselor_api_error(history_response)
+                )
+                history_data = {}
+            else:
+                history_data = history_response.json()
+
+        except RuntimeError as exc:
+            st.error(str(exc))
+            history_data = {}
+        except requests.RequestException as exc:
+            st.error(
+                f"Message history request failed: {type(exc).__name__}."
+            )
+            history_data = {}
+        except ValueError:
+            st.error("Message history was returned in an invalid format.")
+            history_data = {}
+
+        conversation_details = history_data.get("conversation", {})
+        messages = history_data.get("messages", [])
+
+        if conversation_details.get("handling_mode"):
+            current_mode = conversation_details["handling_mode"]
+
+        if not messages:
+            st.info("No messages are available for this conversation yet.")
+
+        else:
+            for chat_message in messages:
+                direction = chat_message.get("direction", "")
+                sender_type = chat_message.get("sender_type", "")
+
+                if direction == "inbound":
+                    role = "user"
+                    sender_label = "Student"
+                else:
+                    role = "assistant"
+                    sender_label = {
+                        "counselor": "Human Counselor",
+                        "system": "System",
+                        "ai": "AI Counselor",
+                    }.get(sender_type, "Outgoing message")
+
+                with st.chat_message(role):
+                    st.caption(
+                        f"{sender_label} ? "
+                        f"{chat_message.get('created_at', '')}"
+                    )
+                    # Plain text avoids rendering student messages as Markdown.
+                    st.text(str(chat_message.get("content", "")))
+
+        # Mark the messages currently shown as read.
+        try:
+            requests.post(
+                f"{COUNSELOR_API_URL}/api/conversations/"
+                f"telegram/{selected_uid}/read",
+                headers=get_counselor_api_headers(),
+                timeout=(5, 10),
+            )
+        except (RuntimeError, requests.RequestException):
+            pass
+
+        st.divider()
+
+        if current_mode == "human":
+
+            st.subheader("Reply to Student")
+
+            with st.form(key=f"counselor_reply_form_{selected_uid}"):
+                reply_text = st.text_area(
+                    "Your message",
+                    max_chars=4000,
+                    height=100,
+                    key=f"counselor_reply_text_{selected_uid}",
+                    placeholder="Write your reply...",
+                )
+
+                send_clicked = st.form_submit_button(
+                    "Send reply to Telegram",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if send_clicked:
+                if not reply_text.strip():
+                    st.error("Write a message before sending.")
+                else:
+                    try:
+                        reply_response = requests.post(
+                            f"{COUNSELOR_API_URL}/api/conversations/"
+                            f"telegram/{selected_uid}/reply",
+                            headers=get_counselor_api_headers(),
+                            json={
+                                "content": reply_text.strip(),
+                                "counselor": os.getenv(
+                                    "COUNSELOR_NAME", "counselor"
+                                ).strip() or "counselor",
+                            },
+                            timeout=(5, 30),
+                        )
+
+                        if reply_response.ok:
+                            st.session_state["inbox_notice"] = (
+                                "Reply sent to Telegram."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Reply failed: "
+                                + get_counselor_api_error(reply_response)
+                            )
+
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                    except requests.RequestException as exc:
+                        st.error(
+                            f"Reply request failed: {type(exc).__name__}."
+                        )
+
+        else:
+            st.info(
+                "AI is handling this conversation. Click "
+                "'Take over conversation' before sending a counselor reply."
+            )
+
+        with st.expander("Conversation Activity / Audit Trail"):
+            try:
+                events_response = requests.get(
+                    f"{COUNSELOR_API_URL}/api/conversations/"
+                    f"telegram/{selected_uid}/events",
+                    params={"limit": 100},
+                    headers=get_counselor_api_headers(),
+                    timeout=(5, 15),
+                )
+
+                if events_response.ok:
+                    events = events_response.json().get("events", [])
+                    if events:
+                        st.dataframe(
+                            [
+                                {
+                                    "Event": event.get("event_type", ""),
+                                    "Actor": event.get("actor", ""),
+                                    "Details": event.get("details", ""),
+                                    "Time": event.get("created_at", ""),
+                                }
+                                for event in events
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.caption("No counselor actions recorded yet.")
+                else:
+                    st.warning("Could not load the activity history.")
+
+            except (RuntimeError, requests.RequestException):
+                st.warning("The activity history is currently unavailable.")
+
+
 # 13. COUNSELOR FOLLOW-UP QUEUE
 # =========================================================
 

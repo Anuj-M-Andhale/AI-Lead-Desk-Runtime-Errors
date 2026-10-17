@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -38,20 +39,30 @@ DEFAULT_MIN_SIMILARITY = 0.42
 
 COURSE_FACT_KEYWORDS = {
     "fee": (
-        "fee", "fees", "price", "cost", "tuition",
-        "फीस", "फी", "शुल्क", "कीमत"
+        "fee", "fees", "price", "prices", "cost", "costs", "tuition",
+        "pay", "payable", "payment", "amount", "charge", "charges",
+        "how much", "have to pay", "will i pay",
+        "\u092b\u0940\u0938", "\u092b\u0940", "\u0936\u0941\u0932\u094d\u0915",
+        "\u0915\u0940\u092e\u0924"
     ),
     "duration": (
-        "duration", "how long", "months",
-        "अवधि", "कितने महीने", "कालावधी", "किती महिने"
+        "duration", "how long", "months", "last", "takes",
+        "\u0905\u0935\u0927\u093f", "\u0915\u093f\u0924\u0928\u0947 \u092e\u0939\u0940\u0928\u0947",
+        "\u0915\u093e\u0932\u093e\u0935\u0927\u0940", "\u0915\u093f\u0924\u0940 \u092e\u0939\u093f\u0928\u0947"
     ),
     "schedule": (
         "schedule", "timing", "timings", "batch",
-        "वेळापत्रक", "वेळ", "क्लास का समय", "समय"
+        "\u0935\u0947\u0933\u093e\u092a\u0924\u094d\u0930\u0915", "\u0935\u0947\u0933",
+        "\u0915\u094d\u0932\u093e\u0938 \u0915\u093e \u0938\u092e\u092f", "\u0938\u092e\u092f"
     ),
     "syllabus": (
-        "syllabus", "curriculum", "topics",
-        "पाठ्यक्रम", "सिलेबस", "अभ्यासक्रम", "विषय"
+        "syllabus", "curriculum", "topics", "topic", "learn",
+        "learning", "covered", "cover", "teach", "taught", "content",
+        "what will i learn", "what is covered",
+        "\u092a\u093e\u0920\u094d\u092f\u0915\u094d\u0930\u092e", "\u0938\u093f\u0932\u0947\u092c\u0938",
+        "\u0905\u092d\u094d\u092f\u093e\u0938\u0915\u094d\u0930\u092e", "\u0935\u093f\u0937\u092f",
+        "\u092a\u0922\u093c\u093e\u092f\u093e", "\u0936\u093f\u0916\u0935\u0932\u0947",
+        "\u0938\u093f\u0916\u093e\u092f\u093e", "\u0936\u093f\u0915\u093e\u092f\u091a\u0947"
     )
 }
 
@@ -243,45 +254,111 @@ class DocumentRAGService:
 
         self.document_chunks = []
         self.document_embeddings = []
+        self._document_signature = None
+        self._index_lock = threading.RLock()
+        self._index_ready = False
         self._build_index()
 
+    def _current_document_signature(self):
+        """Detect added, modified, and removed knowledge-base files."""
+        supported = {".pdf", ".docx", ".txt"}
+
+        if not self.documents_dir.is_dir():
+            return ()
+
+        entries = []
+
+        for path in sorted(self.documents_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in supported:
+                continue
+
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+
+            entries.append((
+                path.relative_to(self.documents_dir).as_posix(),
+                stat.st_mtime_ns,
+                stat.st_size,
+            ))
+
+        return tuple(entries)
+
     def _build_index(self):
+        """Build a fresh index without accumulating old document chunks."""
         if not self.documents_dir.is_dir():
             raise FileNotFoundError(
                 f"Document directory not found: {self.documents_dir}"
             )
 
+        signature = self._current_document_signature()
         supported = {".pdf", ".docx", ".txt"}
+
         document_paths = sorted(
             path for path in self.documents_dir.rglob("*")
             if path.is_file() and path.suffix.lower() in supported
         )
 
         if not document_paths:
-            raise ValueError(
-                f"No PDF, DOCX, or TXT documents found in "
-                f"{self.documents_dir}"
-            )
+            if not self._index_ready:
+                raise ValueError(
+                    f"No PDF, DOCX, or TXT documents found in "
+                    f"{self.documents_dir}"
+                )
+
+            # If every file was removed, clear the obsolete index.
+            with self._index_lock:
+                self.document_chunks = []
+                self.document_embeddings = []
+                self._document_signature = signature
+            return
+
+        new_chunks = []
 
         for file_path in document_paths:
             for section in extract_sections(file_path):
-                for text in self.splitter.split_text(section["text"]):
-                    self.document_chunks.append({
+                for chunk_text in self.splitter.split_text(section["text"]):
+                    new_chunks.append({
                         "source": file_path.name,
                         "section": section["section"],
-                        "chunk_id": len(self.document_chunks),
-                        "text": text
+                        "chunk_id": len(new_chunks),
+                        "text": chunk_text,
                     })
 
-        if not self.document_chunks:
+        if not new_chunks:
             raise ValueError(
                 "No readable text was extracted from the institute documents."
             )
 
-        texts = [item["text"] for item in self.document_chunks]
-        self.document_embeddings = (
-            self.embedding_model.embed_documents(texts)
+        new_embeddings = self.embedding_model.embed_documents(
+            [item["text"] for item in new_chunks]
         )
+
+        if len(new_embeddings) != len(new_chunks):
+            raise RuntimeError(
+                "Embedding count does not match the document chunk count."
+            )
+
+        # Publish the new index only after extraction and embeddings succeed.
+        with self._index_lock:
+            (
+                self.document_chunks,
+                self.document_embeddings,
+                self._document_signature,
+                self._index_ready,
+            ) = (new_chunks, new_embeddings, signature, True)
+
+    def refresh_index_if_changed(self):
+        """Rebuild the knowledge index only when files have changed."""
+        with self._index_lock:
+            signature = self._current_document_signature()
+
+            if signature == self._document_signature:
+                return False
+
+            self._build_index()
+            return True
 
     def detect_policy_query(self, query):
         query_lower = query.lower()
@@ -290,30 +367,124 @@ class DocumentRAGService:
     def search_documents(
         self, query, top_k=3, min_similarity=DEFAULT_MIN_SIMILARITY
     ):
+        """Rank institute passages using semantic and lexical evidence."""
+        query = str(query).strip()
+        if not query:
+            return []
+
+        self.refresh_index_if_changed()
         query_vector = self.embedding_model.embed_query(query)
         is_policy = self.detect_policy_query(query)
-        threshold = min(min_similarity, POLICY_MIN_SIMILARITY) if is_policy else min_similarity
 
+        # Equivalent terms help with common English paraphrases.
+        aliases = {
+            "fee": {
+                "fees", "price", "prices", "cost", "costs", "tuition",
+                "payment", "pay", "payable", "amount", "pricing", "charge",
+                "charges", "expensive", "cheap"
+            },
+            "duration": {
+                "length", "period", "months", "weeks", "long", "last",
+                "takes", "time"
+            },
+            "schedule": {
+                "timing", "timings", "batch", "batches", "class", "classes",
+                "days", "weekend", "weekends"
+            },
+            "syllabus": {
+                "curriculum", "topics", "subjects", "modules", "learn",
+                "learning", "teach", "taught", "covered", "cover", "content",
+                "study", "studied"
+            },
+            "placement": {"job", "jobs", "employment", "career", "work"},
+            "discount": {
+                "scholarship", "concession", "offer", "waiver", "reduction"
+            },
+        }
+
+        def tokens(text):
+            return set(re.findall(r"[a-z0-9]+|[\u0900-\u097f]+",
+                                  str(text).lower()))
+
+        query_tokens = tokens(query)
+        expanded_tokens = set(query_tokens)
+        for canonical, variants in aliases.items():
+            group = set(variants) | {canonical}
+            if query_tokens & group:
+                expanded_tokens.update(group)
+
+        stop_words = {
+            "what", "which", "where", "when", "who", "why", "how",
+            "is", "are", "was", "were", "the", "a", "an", "and",
+            "or", "to", "for", "of", "in", "on", "at", "with",
+            "please", "tell", "me", "about", "can", "could", "would",
+            "do", "does", "did", "i", "my", "we", "you", "your",
+            "hai", "hain", "ka", "ki", "ke", "kya", "hai", "bataye",
+            "sanga", "mala", "aahe", "ahe", "kay",
+        }
+        meaningful_tokens = query_tokens - stop_words
+
+        threshold = (
+            min(min_similarity, POLICY_MIN_SIMILARITY)
+            if is_policy else min_similarity
+        )
         scored = []
 
         for chunk, vector in zip(
             self.document_chunks, self.document_embeddings
         ):
-            similarity = cosine_similarity(query_vector, vector)
-            item = {**chunk, "similarity": float(similarity)}
+            text = str(chunk["text"])
+            section = str(chunk["section"])
+            searchable = (section + " " + text).lower()
 
-            if is_policy:
-                searchable = (
-                    str(chunk["section"]).lower() + " " + chunk["text"].lower()
-                )
-                if not any(term in searchable for term in POLICY_EVIDENCE_TERMS):
-                    continue
+            if is_policy and not any(
+                term in searchable for term in POLICY_EVIDENCE_TERMS
+            ):
+                continue
 
-            if similarity >= threshold:
-                scored.append(item)
+            semantic = cosine_similarity(query_vector, vector)
+            chunk_tokens = tokens(searchable)
 
-        scored.sort(key=lambda item: item["similarity"], reverse=True)
-        return scored[:top_k]
+            # Map every synonym back to its canonical concept.
+            # This supports both directions: "pay" <-> "fee",
+            # "topics" <-> "syllabus", and similar variants.
+            synonym_groups = {}
+            for canonical, variants in aliases.items():
+                family = set(variants) | {canonical}
+                for word in family:
+                    synonym_groups[word] = family
+
+            matched = 0
+            for token in meaningful_tokens:
+                family = synonym_groups.get(token, {token})
+                if any(chunk_token in family for chunk_token in chunk_tokens):
+                    matched += 1
+
+            lexical = (
+                matched / len(meaningful_tokens)
+                if meaningful_tokens else 0.0
+            )
+
+            # Keep semantic relevance dominant while allowing exact
+            # terms to rescue relevant passages with lower embedding scores.
+            combined = (0.80 * semantic) + (0.20 * lexical)
+
+            if semantic >= threshold or lexical >= 0.30:
+                scored.append({
+                    **chunk,
+                    "similarity": float(combined),
+                    "semantic_similarity": float(semantic),
+                    "lexical_similarity": float(lexical),
+                })
+
+        scored.sort(
+            key=lambda item: (
+                item["similarity"],
+                item["semantic_similarity"]
+            ),
+            reverse=True
+        )
+        return scored[:max(1, int(top_k))]
 
     def get_retrieved_context(self, query, top_k=3):
         chunks = self.search_documents(query, top_k=top_k)
@@ -460,7 +631,7 @@ class DocumentRAGService:
             }
 
         details = [
-            f"{labels[field]}: {value}"
+            f"{labels[field]}: {value.rstrip().rstrip(chr(46))}"
             for field, value in extracted.items()
         ]
 
@@ -500,6 +671,77 @@ class DocumentRAGService:
             )
         }
 
+
+    def _course_overview_answer(self, query, section, response_language=None):
+        """Build a course overview only from fields present in its catalog section."""
+        language = response_language or detect_language(query)
+        section_lower = section.strip().lower()
+
+        matching_chunks = [
+            item for item in self.document_chunks
+            if item["section"].strip().lower() == section_lower
+        ]
+        if not matching_chunks:
+            return {
+                "answer": self._fallback(query, language),
+                "grounded": False,
+                "sources": [],
+                "answer_mode": "fallback_no_course_evidence"
+            }
+
+        section_text = "\n".join(item["text"] for item in matching_chunks)
+        selected = matching_chunks[0]
+        fields = []
+
+        course_id = re.search(r"(?im)^\s*Course ID\s*:\s*(.+?)\s*$", section_text)
+        if course_id:
+            fields.append(("Course ID", course_id.group(1).strip()))
+
+        for field in ("fee", "duration", "schedule", "syllabus"):
+            match = re.search(FIELD_PATTERNS[field], section_text)
+            if match:
+                fields.append((
+                    FIELD_LABELS[language][field],
+                    match.group(1).strip().rstrip(".")
+                ))
+
+        if not fields:
+            return {
+                "answer": self._fallback(query, language),
+                "grounded": False,
+                "sources": [],
+                "answer_mode": "fallback_no_course_fields"
+            }
+
+        if language == "hindi":
+            intro = f"?????? ????????? ?? ??????, {section} ?? ???????:"
+        elif language == "marathi":
+            intro = f"?????? ?????????????, {section} ?? ??????:"
+        else:
+            intro = f"According to the institute's document, here is the overview of {section}:"
+
+        details = [f"{label}: {value}" for label, value in fields]
+        return {
+            "answer": intro + "\n" + "\n".join(details),
+            "grounded": True,
+            "sources": [{
+                "source": selected["source"],
+                "chunk_id": selected["chunk_id"],
+                "similarity": round(float(next(
+                    (
+                        item.get("similarity", 0.0)
+                        for item in self.search_documents(
+                            query, top_k=max(1, len(self.document_chunks))
+                        )
+                        if item["source"] == selected["source"]
+                        and item["chunk_id"] == selected["chunk_id"]
+                    ),
+                    0.0
+                )), 4)
+            }],
+            "answer_mode": "deterministic_course_overview"
+        }
+
     def answer(self, query, response_language=None):
         """Answer using retrieved evidence and an optional response language."""
         if response_language not in (None, 'en', 'hi', 'mr'):
@@ -510,6 +752,7 @@ class DocumentRAGService:
             raise ValueError("The student question cannot be empty.")
 
         query = query.strip()
+        self.refresh_index_if_changed()
         query_lower = query.lower()
         language = response_language or detect_language(query)
 
@@ -575,6 +818,18 @@ class DocumentRAGService:
                 }
 
         fields = self._requested_fields(query)
+
+        overview_terms = (
+            "tell me about", "overview", "describe",
+            "course details", "details about", "information about",
+            "give me details", "explain this course"
+        )
+        if not fields and any(term in query_lower for term in overview_terms):
+            section = self._find_course_section(query)
+            if section:
+                return self._course_overview_answer(
+                    query, section, language
+                )
 
         if fields and not self.detect_policy_query(query):
             section = self._find_course_section(query)

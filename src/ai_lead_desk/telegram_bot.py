@@ -463,6 +463,9 @@ async def start(
     context.user_data.setdefault("voice_replies", False)
 
     lead_store.get_or_create_lead("telegram", user.id)
+    lead_store.set_platform_chat_id(
+        "telegram", user.id, message.chat.id
+    )
     lead_store.set_awaiting_name("telegram", user.id, True)
 
     await message.reply_text(
@@ -767,6 +770,9 @@ async def answer_question(
 
         user = message.from_user
         if user:
+            lead_store.set_platform_chat_id(
+                "telegram", user.id, message.chat.id
+            )
             recent = lead_store.get_recent_messages(
                 "telegram", user.id, limit=13
             )
@@ -792,50 +798,32 @@ async def answer_question(
         else:
             history = []
 
+        if user and lead_store.get_handling_mode('telegram', user.id) == 'human':
+            return
+
         mode = context.user_data.get("assistant_mode", "institute")
+
         if mode == "guidance":
+            # Guidance mode retains conversation history.
             answer = await get_guidance_answer(query, history)
         else:
-            prior_turns = []
-            for item in history[-6:]:
-                content = str(item.get("content", "")).strip()
-                if content:
-                    speaker = (
-                        "Student" if item.get("direction") == "inbound"
-                        else "Assistant"
-                    )
-                    prior_turns.append(f"{speaker}: {content[:1000]}")
-            rag_query = query
-            if prior_turns:
-                rag_query = (
-                    "Use this recent conversation only to resolve references "
-                    "in the latest question. Answer institute facts only from "
-                    "retrieved institute documents.\n\n"
-                    "Recent conversation:\n"
-                    + "\n".join(prior_turns)
-                    + "\n\nLatest student question: "
-                    + query
-                )
-            answer = await get_ai_answer(rag_query)
+            # Institute Doubts must process the latest question by itself.
+            # Old messages can contain unrelated terms such as "discount"
+            # and incorrectly trigger the RAG policy detector.
+            answer = await get_ai_answer(query)
 
-        # Match the response language to the user's original question.
-        # If language adaptation fails, keep the original RAG answer.
-        if mode != "guidance":
-            try:
-                answer = await asyncio.to_thread(
-                    adapt_answer_to_question_language,
-                    query,
-                    answer,
-                )
-            except Exception:
-                logger.exception(
-                    "Could not adapt the institute answer language; "
-                    "using the original answer."
-                )
+        # A counselor may have taken over while the model was generating.
+        # Discard that answer instead of delivering it after takeover.
+        if user and lead_store.get_handling_mode('telegram', user.id) == 'human':
+            return
 
         if message.from_user:
             lead_store.add_message(
-                "telegram", message.from_user.id, "outbound", answer
+                "telegram",
+                message.from_user.id,
+                "outbound",
+                answer,
+                sender_type="ai",
             )
 
         if not audio_input:
@@ -903,6 +891,9 @@ async def handle_text(
         return
 
     lead = lead_store.get_or_create_lead("telegram", user.id)
+    lead_store.set_platform_chat_id(
+        "telegram", user.id, message.chat.id
+    )
 
     if lead["awaiting_name"]:
         if len(text) < 2 or len(text) > 100 or len(text.split()) > 5:

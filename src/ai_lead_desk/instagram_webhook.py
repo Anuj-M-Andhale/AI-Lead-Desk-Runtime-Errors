@@ -5,12 +5,14 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from ai_lead_desk import lead_store
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -199,6 +201,14 @@ async def process_message(message):
     try:
         logger.info("Background processing started for message %s.", message_id)
 
+        lead_store.get_or_create_lead("instagram", message["sender_id"])
+        lead_store.add_message(
+            "instagram",
+            message["sender_id"],
+            "inbound",
+            message["text"],
+        )
+
         service = await get_rag_service()
 
         logger.info("Generating grounded answer for message %s.", message_id)
@@ -215,6 +225,12 @@ async def process_message(message):
             )
 
         logger.info("Answer generated; sending reply for message %s.", message_id)
+        lead_store.add_message(
+            "instagram",
+            message["sender_id"],
+            "outbound",
+            answer,
+        )
         await send_instagram_reply(message["sender_id"], answer)
 
         logger.info("Message %s processed successfully.", message_id)
@@ -261,3 +277,54 @@ async def receive_webhook(request: Request):
         asyncio.create_task(process_message(message))
 
     return {"status": "received"}
+
+
+@app.get("/api/history/{platform}/{platform_user_id}")
+async def get_conversation_history(
+    platform: str,
+    platform_user_id: str,
+    limit: int = 20,
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+):
+    """Return a user's recent messages to authorized internal clients."""
+    configured_key = os.getenv("AI_LEAD_DESK_API_KEY", "").strip()
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="History API is not configured on this server.",
+        )
+
+    if not x_api_key or not secrets.compare_digest(
+        x_api_key, configured_key
+    ):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    platform = platform.strip().lower()
+    platform_user_id = platform_user_id.strip()
+
+    if platform not in {"telegram", "instagram"}:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    if not platform_user_id or len(platform_user_id) > 200:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="Limit must be 1-100")
+
+    try:
+        messages = await asyncio.to_thread(
+            lead_store.get_recent_messages,
+            platform,
+            platform_user_id,
+            limit,
+        )
+    except Exception:
+        logger.exception("Could not retrieve conversation history.")
+        raise HTTPException(
+            status_code=500, detail="Could not retrieve conversation history"
+        )
+
+    return {
+        "platform": platform,
+        "platform_user_id": platform_user_id,
+        "count": len(messages),
+        "messages": messages,
+    }

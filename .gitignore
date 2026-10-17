@@ -1,4 +1,4 @@
-﻿.env
+.env
 .env.*
 !.env.example
 __pycache__/
@@ -8,3 +8,8 @@ __pycache__/
 data/*.db
 ffmpeg/
 ffmpeg-essentials.zip
+# Private documents uploaded through the counselor workspace
+data/institute_documents/uploads/
+# Jupyter notebook checkpoint directories
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/

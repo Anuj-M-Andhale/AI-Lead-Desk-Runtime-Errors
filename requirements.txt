@@ -10,3 +10,7 @@ streamlit
 ipywidgets
 faster-whisper
 google-genai
+fastapi
+uvicorn
+python-multipart
+httpx
