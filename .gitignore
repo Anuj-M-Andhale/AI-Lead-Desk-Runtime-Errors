@@ -1,2 +1,10 @@
 ﻿.env
-.ipynb_checkpoints/
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.backup*
+*backup*
+data/*.db
+ffmpeg/
+ffmpeg-essentials.zip
